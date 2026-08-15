@@ -1,8 +1,21 @@
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
-mcp = FastMCP("DevMate")
+transport_security = TransportSecuritySettings(
+    enable_dns_rebinding_protection=True,
+    allowed_hosts=[
+        "localhost:*",
+        "127.0.0.1:*",
+        "mcp:*",
+    ],
+)
+
+mcp = FastMCP(
+    "DevMate",
+    transport_security=transport_security,
+)
 
 
 @mcp.tool()
@@ -36,4 +49,6 @@ def write_file(file_path: str, content: str) -> str:
 
 
 if __name__ == "__main__":
+    mcp.settings.host = "0.0.0.0"
+    mcp.settings.port = 8000
     mcp.run(transport="streamable-http")

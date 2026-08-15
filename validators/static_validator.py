@@ -1,6 +1,6 @@
 import ast
 from pathlib import Path
-
+import sys
 
 STANDARD_LIBS = {
     "os",
@@ -24,6 +24,7 @@ STANDARD_LIBS = {
     "copy",
 }
 
+STANDARD_LIBS |= sys.stdlib_module_names
 
 def validate_project(plan, project):
 
@@ -100,9 +101,10 @@ def validate_project(plan, project):
 
         except SyntaxError:
 
-            report["broken_imports"].append(
-                f"Syntax error in {path}"
-            )
+            report["broken_imports"].append({
+                "file": path,
+                "error": "Syntax error"
+            })
 
             continue
 
@@ -146,7 +148,10 @@ def validate_project(plan, project):
 
                     if expected not in generated_files:
 
-                        report["broken_imports"].append(module)
+                        report["broken_imports"].append({
+                            "file": path,
+                            "import": module
+                        })
 
     # ----------------------------------
     # Missing requirements
@@ -156,6 +161,19 @@ def validate_project(plan, project):
         *STANDARD_LIBS,
         "app",
         "student_api",
+
+        # Local project modules
+        "config",
+        "database",
+        "models",
+        "routers",
+        "schemas",
+        "services",
+        "__future__",
+        "main",
+        "student",
+        "student_router",
+        "student_service",
     }
 
     for package in sorted(imported_packages):
@@ -171,21 +189,33 @@ def validate_project(plan, project):
             "pydantic": "pydantic",
             "sqlalchemy": "sqlalchemy",
             "tortoise": "tortoise-orm",
+            "pydantic_settings": "pydantic-settings",
         }.get(package, package)
 
         if mapped.lower() not in requirements:
 
             report["missing_requirements"].append(mapped)
 
-    # remove duplicates
+    # ----------------------------------
+    # Remove duplicates
+    # ----------------------------------
 
     report["missing_requirements"] = sorted(
         set(report["missing_requirements"])
     )
 
-    report["broken_imports"] = sorted(
-        set(report["broken_imports"])
-    )
+    seen = set()
+    unique_imports = []
+
+    for item in report["broken_imports"]:
+
+        key = tuple(sorted(item.items()))
+
+        if key not in seen:
+            seen.add(key)
+            unique_imports.append(item)
+
+    report["broken_imports"] = unique_imports
 
     report["empty_files"] = sorted(
         set(report["empty_files"])

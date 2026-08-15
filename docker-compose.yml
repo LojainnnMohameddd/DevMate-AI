@@ -1,0 +1,52 @@
+services:
+
+  mcp:
+    build: .
+    container_name: devmate-mcp
+    working_dir: /app
+
+    volumes:
+      - .:/app
+
+    env_file:
+      - .env
+
+    command: python mcp_server/server.py
+
+    ports:
+      - "8000:8000"
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import socket; socket.create_connection(('127.0.0.1', 8000), 2)"
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+
+  orchestrator:
+    build: .
+    container_name: devmate
+
+    working_dir: /app
+
+    volumes:
+      - .:/app
+
+    env_file:
+      - .env
+
+    stdin_open: true
+    tty: true
+
+    depends_on:
+      mcp:
+        condition: service_healthy
+
+    command: python main.py

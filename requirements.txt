@@ -1,4 +1,6 @@
 google-genai
 python-dotenv
-mcp
+mcp==1.29.0
 ollama
+groq
+pydantic==2.11.10

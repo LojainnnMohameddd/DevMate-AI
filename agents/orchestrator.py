@@ -11,50 +11,14 @@ from validators.static_validator import validate_project
 from agents.execution import execute_project
 from agents.fixer import fix_project
 
-async def execute_plan(user_request: str):
 
-    print("1. Creating plan...")
-    plan = create_plan(user_request)
-    print("Plan created!")
+MAX_REVIEW_FIX_ATTEMPTS = 2
+MAX_FIX_ATTEMPTS = 3
 
-    print("2. Generating project...")
-    project = generate_project(user_request, plan)
-    print("Project generated!")
 
-    # -----------------------------
-    # Static Validation
-    # -----------------------------
-    print("3. Running static validation...")
-
-    validation = validate_project(
-        plan,
-        project
-    )
-
-    print("Static validation completed!")
-    print(validation)
-
-    # -----------------------------
-    # Reviewer
-    # -----------------------------
-    print("4. Reviewing project...")
-
-    review = review_project(
-        user_request,
-        plan,
-        project,
-        validation      
-    )
-
-    print("Review completed!")
-    print(review)
-
-    if not review["request_satisfied"]:
-        print("\nReview failed. Execution skipped.")
-        return
-
+async def _write_files_via_mcp(plan, project):
     async with streamablehttp_client(
-        "http://127.0.0.1:8000/mcp"
+        "http://mcp:8000/mcp"
     ) as (read_stream, write_stream, _):
 
         async with ClientSession(read_stream, write_stream) as session:
@@ -97,68 +61,389 @@ async def execute_plan(user_request: str):
 
                 print(result.content[0].text)
 
-    project_name = "student_api"
-    project_path = Path("generated_projects") / project_name
 
-    MAX_FIX_ATTEMPTS = 3
+def _merge_fixed_files(project, fixed_project):
+    fixed_paths = {
+        file["path"]
+        for file in fixed_project["files"]
+    }
 
-    for attempt in range(MAX_FIX_ATTEMPTS):
+    project["files"] = [
+        file
+        for file in project["files"]
+        if file["path"] not in fixed_paths
+    ]
 
-        print(f"\n===== Execution Attempt {attempt + 1} =====")
+    project["files"].extend(
+        fixed_project["files"]
+    )
 
-        execution = execute_project(str(project_path))
 
-        print(execution)
+async def _apply_fixed_files(fixed_project):
+    async with streamablehttp_client(
+        "http://mcp:8000/mcp"
+    ) as (read_stream, write_stream, _):
 
-        if execution["passed"]:
-            print("\nProject executed successfully!")
+        async with ClientSession(
+            read_stream,
+            write_stream
+        ) as session:
+
+            await session.initialize()
+
+            for file in fixed_project["files"]:
+
+                print(
+                    f"\nUpdating: {file['path']}"
+                )
+
+                result = await session.call_tool(
+                    "write_file",
+                    {
+                        "file_path": file["path"],
+                        "content": file["content"]
+                    }
+                )
+
+                print(result.content[0].text)
+
+
+async def execute_plan(user_request: str):
+
+    # -----------------------------
+    # Planning
+    # -----------------------------
+
+    print("1. Creating plan...")
+
+    plan = create_plan(
+        user_request
+    )
+
+    print("Plan created!")
+
+    # -----------------------------
+    # Code Generation
+    # -----------------------------
+
+    print("2. Generating project...")
+
+    project = generate_project(
+        user_request,
+        plan
+    )
+
+    print("Project generated!")
+
+    # -----------------------------
+    # Static Validation
+    # -----------------------------
+
+    print("3. Running static validation...")
+
+    validation = validate_project(
+        plan,
+        project
+    )
+
+    print("Static validation completed!")
+    print(validation)
+
+    # -----------------------------
+    # Reviewer
+    # -----------------------------
+
+    print("4. Reviewing project...")
+
+    review = review_project(
+        user_request,
+        plan,
+        project,
+        validation
+    )
+
+    print("Review completed!")
+    print(review)
+
+    # -----------------------------
+    # Reviewer Auto-Fix Loop
+    # -----------------------------
+
+    review_fix_attempt = 0
+
+    while (
+        not review["request_satisfied"]
+        and
+        review_fix_attempt < MAX_REVIEW_FIX_ATTEMPTS
+    ):
+
+        review_fix_attempt += 1
+
+        print(
+            f"\nReview flagged issues "
+            f"(attempt {review_fix_attempt}/"
+            f"{MAX_REVIEW_FIX_ATTEMPTS}). "
+            f"Attempting to fix based on "
+            f"review feedback before execution..."
+        )
+
+        pre_execution_placeholder = {
+            "passed": False,
+            "stdout": "",
+            "stderr": (
+                "N/A - the project was not executed. "
+                "The Reviewer flagged issues before "
+                "execution; see the review report "
+                "for details."
+            ),
+        }
+
+        try:
+
+            fixed_project = fix_project(
+                user_request,
+                plan,
+                project,
+                review,
+                pre_execution_placeholder,
+            )
+
+        except Exception as e:
+
+            print(
+                "\n[orchestrator] Fixer failed during "
+                f"review-fix attempt: {e}"
+            )
+
             break
 
-        print("\nFixing project...")
+        print("\n===== REVIEW-FIX RESULT =====")
+        print(fixed_project)
+        print("==============================")
 
-        fixed_project = fix_project(
+        _merge_fixed_files(
+            project,
+            fixed_project
+        )
+
+        print(
+            "\n5. Re-validating project after fix..."
+        )
+
+        validation = validate_project(
+            plan,
+            project
+        )
+
+        print(validation)
+
+        print(
+            "6. Re-reviewing project..."
+        )
+
+        review = review_project(
             user_request,
             plan,
             project,
-            review,
-            execution
+            validation
         )
 
-        print(fixed_project)
+        print(review)
 
-        project["files"] = [
-            file for file in project["files"]
-            if file["path"] not in {f["path"] for f in fixed_project["files"]}
-        ]
+    if not review["request_satisfied"]:
 
-        project["files"].extend(fixed_project["files"])
+        print(
+            f"\nReview still failing after "
+            f"{MAX_REVIEW_FIX_ATTEMPTS} fix "
+            f"attempt(s). Proceeding to write "
+            f"and execute anyway -- the "
+            f"execution/fix loop below may still "
+            f"resolve remaining issues."
+        )
 
-        # -----------------------------
-        # Apply Fixes
-        # -----------------------------
-        async with streamablehttp_client(
-            "http://127.0.0.1:8000/mcp"
-        ) as (read_stream, write_stream, _):
+    # -----------------------------
+    # Write Initial Project via MCP
+    # -----------------------------
 
-            async with ClientSession(read_stream, write_stream) as session:
+    print(
+        "\n===== Writing Project via MCP ====="
+    )
 
-                await session.initialize()
+    await _write_files_via_mcp(
+        plan,
+        project
+    )
 
-                for file in fixed_project["files"]:
+    print("\n===== PLAN =====")
+    print(plan)
 
-                    print(f"\nUpdating: {file['path']}")
+    # -----------------------------
+    # Determine Project Root
+    # -----------------------------
 
-                    result = await session.call_tool(
-                        "write_file",
-                        {
-                            "file_path": file["path"],
-                            "content": file["content"]
-                        }
-                    )
+    project_roots = {
+        Path(file["path"]).parts[0]
+        for file in project["files"]
+        if len(Path(file["path"]).parts) > 1
+    }
 
-                    print(result.content[0].text)
+    if len(project_roots) != 1:
 
-        
+        raise RuntimeError(
+            "Expected exactly one project root, "
+            f"got: {project_roots}"
+        )
+
+    project_name = project_roots.pop()
+
+    project_path = (
+        Path("generated_projects")
+        / project_name
+    )
+
+    print(
+        "\n===== PROJECT PATH ====="
+    )
+
+    print(project_path)
+    print(
+        "Exists:",
+        project_path.exists()
+    )
+
+    if project_path.exists():
+
+        print("\nFiles:")
+
+        for path in project_path.rglob("*"):
+
+            print(
+                " -",
+                path.relative_to(
+                    project_path
+                )
+            )
+
+    # -----------------------------
+    # Execution + Auto-Fix Loop
+    # -----------------------------
+
+    for attempt in range(
+        MAX_FIX_ATTEMPTS
+    ):
+
+        print(
+            f"\n===== Execution Attempt "
+            f"{attempt + 1}/"
+            f"{MAX_FIX_ATTEMPTS} ====="
+        )
+
+        execution = execute_project(
+            str(project_path)
+        )
+
+        print(execution)
+
+        # -------------------------
+        # Success
+        # -------------------------
+
+        if execution["passed"]:
+
+            print(
+                "\nProject executed successfully!"
+            )
+
+            break
+
+        # -------------------------
+        # Execution Failed
+        # -------------------------
+
+        print(
+            "\nProject execution failed."
+        )
+
+        print(
+            "\nSending execution error "
+            "to Fix Agent..."
+        )
+
+        try:
+
+            fixed_project = fix_project(
+                user_request,
+                plan,
+                project,
+                review,
+                execution
+            )
+
+        except Exception as e:
+
+            print(
+                "\n[orchestrator] Fixer failed "
+                f"during execution-fix attempt: {e}"
+            )
+
+            break
+
+        print(
+            "\n===== EXECUTION-FIX RESULT ====="
+        )
+
+        print(
+            fixed_project
+        )
+
+        print(
+            "================================="
+        )
+
+        # -------------------------
+        # Merge Fixed Files
+        # -------------------------
+
+        _merge_fixed_files(
+            project,
+            fixed_project
+        )
+
+        # -------------------------
+        # Apply Fixes through MCP
+        # -------------------------
+
+        try:
+
+            await _apply_fixed_files(
+                fixed_project
+            )
+
+        except Exception as e:
+
+            print(
+                "\n[orchestrator] Failed to "
+                "apply fixes through MCP: "
+                f"{e}"
+            )
+
+            break
+
+        print(
+            "\nFixes applied successfully."
+        )
+
+    else:
+
+        print(
+            "\nMaximum execution-fix attempts "
+            "reached."
+        )
+
+    print(
+        "\n===== DevMate Finished ====="
+    )
+
 
 if __name__ == "__main__":
 

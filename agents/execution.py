@@ -19,6 +19,31 @@ def execute_project(project_path: str) -> dict:
 
     project_path = Path(project_path)
 
+    requirements = project_path / "requirements.txt"
+
+    if requirements.exists():
+        print("\nInstalling dependencies...")
+
+        install = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "-r",
+                "requirements.txt",
+            ],
+            cwd=project_path,
+            capture_output=True,
+            text=True,
+        )
+
+        print("\n===== PIP STDOUT =====")
+        print(install.stdout)
+
+        print("\n===== PIP STDERR =====")
+        print(install.stderr)
+
     if not project_path.exists():
         return {
             "passed": False,
@@ -32,7 +57,10 @@ def execute_project(project_path: str) -> dict:
     entry_candidates = [
         "main.py",
         "app.py",
-        "run.py"
+        "run.py",
+        "app/main.py",
+        "src/main.py",
+        "src/app.py",
     ]
 
     entry_file = None
@@ -55,14 +83,20 @@ def execute_project(project_path: str) -> dict:
         }
 
     try:
+        module = (
+            entry_file.relative_to(project_path)
+            .with_suffix("")
+            .as_posix()
+            .replace("/", ".")
+        )
+
         result = subprocess.run(
-            [sys.executable, entry_file.name],
+            [sys.executable, "-m", module],
             cwd=project_path,
             capture_output=True,
             text=True,
             timeout=30
         )
-
         errors = []
 
         if result.returncode != 0:

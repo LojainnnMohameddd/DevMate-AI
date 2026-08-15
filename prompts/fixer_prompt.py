@@ -1,17 +1,29 @@
 import json
 
 
-def fixer_prompt(
+def fixer_prompt(user_request, plan, project, review, execution):
+    # Legacy / fallback
+    return ""
+
+
+def summarize_project(project):
+    return {
+        "files": [f["path"] for f in project["files"]]
+    }
+
+
+def fixer_diagnosis_prompt(
     user_request,
     plan,
     project,
     review,
     execution,
-):
-    return f"""
-You are a Senior Python Software Engineer specializing in debugging.
+) -> str:
 
-Your task is to FIX the generated project.
+    return f"""
+You are a Principal Python Software Engineer specializing in debugging.
+
+Your task is to determine ALL files that should be fixed.
 
 =====================
 USER REQUEST
@@ -26,10 +38,10 @@ PLAN
 {json.dumps(plan, indent=2)}
 
 =====================
-CURRENT PROJECT
+PROJECT FILES
 =====================
 
-{json.dumps(project, indent=2)}
+{json.dumps(summarize_project(project), indent=2)}
 
 =====================
 REVIEW REPORT
@@ -47,63 +59,30 @@ EXECUTION REPORT
 INSTRUCTIONS
 =====================
 
-Analyze the ENTIRE project before making any changes.
+Read BOTH the review report and execution report.
 
-If the same root cause affects multiple files,
-fix ALL affected files in a SINGLE response.
+Identify ALL root causes.
 
-Do NOT stop after fixing the first failing file.
+Do NOT stop at the first exception.
 
-Search the entire project for similar issues.
+Think ahead.
 
-Fix ONLY the files required to solve the root cause.
-
-Do NOT rewrite the entire project.
-
-Preserve all working code.
-
-Return ONLY the modified files.
-
-=====================
-ROOT CAUSE ANALYSIS
-=====================
-
-Before modifying code:
-
-1. Read the execution error carefully.
-2. Identify the REAL root cause.
-3. Fix the root cause, not the symptom.
-4. If the same mistake exists in multiple files,
-correct every occurrence.
-5. Make sure no file still contains the same bug.
+If fixing one file will expose another obvious error,
+include that file now.
 
 Examples:
 
-- If an import path is wrong,
-  FIX the import statement.
+- Missing dependency in requirements.txt
+- Wrong import pattern
+- Missing config fields
+- Deprecated Pydantic API
+- SQLAlchemy incompatibility
+- Async/sync mismatch
+- Missing response models
+- Broken package exports
+- Missing __init__ exports
 
-- Do NOT add sys.path hacks.
-
-- Do NOT suppress exceptions.
-
-- Do NOT comment out code.
-
-- Do NOT invent missing files unless they are actually required.
-
-- If requirements.txt is missing a dependency,
-  update only requirements.txt.
-
-- If an import like
-
-    from student_api.app.routers.student import router
-
-fails because the project is executed from the project root,
-
-replace it with the correct import
-
-    from app.routers.student import router
-
-instead of modifying sys.path.
+Return ONLY files that actually require modification.
 
 =====================
 OUTPUT
@@ -111,18 +90,116 @@ OUTPUT
 
 Return ONLY valid JSON.
 
-Do not explain anything.
-
-Do not use markdown.
-
 Schema:
 
 {{
-    "files": [
-        {{
-            "path": "...",
-            "content": "..."
-        }}
+    "root_cause": "short explanation",
+    "affected_files": [
+        "path/file1.py",
+        "path/file2.py"
     ]
 }}
+"""
+
+
+def fixer_file_prompt(
+    user_request,
+    root_cause,
+    file_path,
+    current_content,
+    related_files,
+    execution,
+):
+
+    related = json.dumps(
+        related_files,
+        indent=2,
+        ensure_ascii=False,
+    )
+
+    return f"""
+You are a Principal Python Software Engineer.
+
+Your goal is NOT simply fixing today's exception.
+
+Your goal is to make this file production-ready and
+prevent future execution failures.
+
+=====================
+USER REQUEST
+=====================
+
+{user_request}
+
+=====================
+ROOT CAUSE
+=====================
+
+{root_cause}
+
+=====================
+EXECUTION REPORT
+=====================
+
+{json.dumps(execution, indent=2)}
+
+=====================
+TARGET FILE
+=====================
+
+{file_path}
+
+=====================
+CURRENT FILE
+=====================
+
+{current_content}
+
+=====================
+RELATED FILES
+=====================
+
+{related}
+
+=====================
+INSTRUCTIONS
+=====================
+
+Fix this file completely.
+
+Do NOT make the minimum possible edit.
+
+Instead:
+
+- Fix the reported bug.
+- Fix any related bug you discover.
+- Fix broken imports.
+- Fix inconsistent names.
+- Fix invalid references.
+- Fix missing configuration.
+- Fix dependency usage.
+- Fix SQLAlchemy compatibility.
+- Fix FastAPI compatibility.
+- Fix Pydantic v2 compatibility.
+- Fix async/sync inconsistencies.
+- Fix response models.
+- Fix type hints.
+- Fix package exports.
+- Preserve working logic.
+
+Assume this is your ONLY chance to edit this file.
+
+Do NOT introduce placeholders.
+
+Do NOT remove functionality.
+
+Do NOT leave TODO comments.
+
+Output ONLY the COMPLETE corrected file.
+
+No markdown.
+
+No explanations.
+
+No JSON.
 """
