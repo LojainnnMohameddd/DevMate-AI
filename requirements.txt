@@ -4,3 +4,5 @@ mcp==1.29.0
 ollama
 groq
 pydantic==2.11.10
+fastapi
+uvicorn

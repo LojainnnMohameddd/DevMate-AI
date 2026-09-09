@@ -93,9 +93,10 @@ def execute_project(project_path: str) -> dict:
         result = subprocess.run(
             [sys.executable, "-m", module],
             cwd=project_path,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=30,
         )
         errors = []
 

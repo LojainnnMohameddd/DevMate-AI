@@ -1,20 +1,43 @@
 import json
 import os
 from collections import defaultdict
+from pathlib import Path
 
-from prompts.planner_prompt import planner_prompt, planner_completion_prompt
+from prompts.planner_prompt import (
+    planner_prompt,
+    planner_completion_prompt,
+)
 from utils.llm import generate
+
 
 PLANNER_MODEL = "qwen/qwen3.6-27b"
 
+# Qwen reasoning models can consume a large part of the completion
+# budget before producing the final JSON.
+INITIAL_TOKENS = 6000
+MAX_TOKENS = 9000
 
-def _strip_json_fences(text: str):
-    text = text.strip()
+COMPLETION_TOKENS = 2500
+
+
+def _strip_json_fences(text: str) -> str:
+    text = (text or "").strip()
 
     if text.startswith("```json"):
-        text = text.removeprefix("```json").removesuffix("```").strip()
-    elif text.startswith("```"):
-        text = text.removeprefix("```").removesuffix("```").strip()
+        text = text[len("```json"):]
+
+        if text.rstrip().endswith("```"):
+            text = text.rstrip()[:-3]
+
+        return text.strip()
+
+    if text.startswith("```"):
+        text = text[3:]
+
+        if text.rstrip().endswith("```"):
+            text = text.rstrip()[:-3]
+
+        return text.strip()
 
     return text
 
@@ -23,15 +46,22 @@ def _get_plan_file_paths(plan):
     return [
         step["args"]["file_path"]
         for step in plan
-        if step["tool"] == "create_file"
+        if step.get("tool") == "create_file"
+        and "args" in step
+        and "file_path" in step["args"]
     ]
 
 
-def validate_plan_completeness(plan, min_nontrivial_files: int = 1):
+def validate_plan_completeness(
+    plan,
+    min_nontrivial_files: int = 1,
+):
     """
-    Programmatic (non-LLM) check: for every folder that will contain an
-    __init__.py, does the plan also include at least one other
-    (non-__init__) file in that same folder?
+    Programmatic non-LLM validation.
+
+    For every folder containing __init__.py,
+    make sure the same folder contains at least
+    one other implementation file.
     """
 
     file_paths = _get_plan_file_paths(plan)
@@ -39,7 +69,11 @@ def validate_plan_completeness(plan, min_nontrivial_files: int = 1):
     files_by_folder = defaultdict(list)
 
     for path in file_paths:
-        folder = os.path.dirname(path).replace("\\", "/")
+
+        folder = os.path.dirname(
+            path
+        ).replace("\\", "/")
+
         files_by_folder[folder].append(path)
 
     incomplete_folders = []
@@ -47,22 +81,206 @@ def validate_plan_completeness(plan, min_nontrivial_files: int = 1):
     for folder, files in files_by_folder.items():
 
         has_init = any(
-            os.path.basename(f) == "__init__.py"
-            for f in files
+            os.path.basename(file_path)
+            == "__init__.py"
+            for file_path in files
         )
 
         if not has_init:
             continue
 
         non_init_files = [
-            f for f in files
-            if os.path.basename(f) != "__init__.py"
+            file_path
+            for file_path in files
+            if os.path.basename(file_path)
+            != "__init__.py"
         ]
 
         if len(non_init_files) < min_nontrivial_files:
+
             incomplete_folders.append(folder)
 
     return incomplete_folders
+
+
+def _parse_plan(text: str):
+    """
+    Parse the planner response as JSON.
+
+    Supports:
+    - normal JSON array
+    - JSON wrapped in markdown fences
+    - line-separated JSON objects
+    """
+
+    text = _strip_json_fences(text)
+
+    if not text:
+        raise json.JSONDecodeError(
+            "Empty planner response",
+            "",
+            0,
+        )
+
+    try:
+        return json.loads(text)
+
+    except json.JSONDecodeError:
+
+        lines = [
+            line.strip()
+            for line in text.splitlines()
+            if line.strip()
+        ]
+
+        objects = []
+
+        for line in lines:
+
+            if not (
+                line.startswith("{")
+                and line.endswith("}")
+            ):
+                continue
+
+            try:
+                objects.append(
+                    json.loads(line)
+                )
+            except json.JSONDecodeError:
+                continue
+
+        if objects:
+            return objects
+
+        raise
+
+
+def _validate_plan_structure(plan):
+    """
+    Programmatic validation of the planner output.
+    """
+
+    if not isinstance(plan, list):
+
+        raise RuntimeError(
+            "Planner output must be a JSON array."
+        )
+
+    if not plan:
+
+        raise RuntimeError(
+            "Planner returned an empty plan."
+        )
+
+    # ---------------------------------------------------------
+    # Validate root project folder
+    # ---------------------------------------------------------
+
+    create_folder_steps = [
+        step
+        for step in plan
+        if step.get("tool") == "create_folder"
+    ]
+
+    if len(create_folder_steps) != 1:
+
+        raise RuntimeError(
+            "Planner must generate exactly one "
+            "root project folder."
+        )
+
+    root = (
+        create_folder_steps[0]
+        .get("args", {})
+        .get("folder_name")
+    )
+
+    if not root:
+
+        raise RuntimeError(
+            "Root project folder name is missing."
+        )
+
+    root = Path(root).as_posix()
+
+    # ---------------------------------------------------------
+    # Validate create_file paths
+    # ---------------------------------------------------------
+
+    for step in plan:
+
+        if step.get("tool") != "create_file":
+            continue
+
+        file_path = (
+            step
+            .get("args", {})
+            .get("file_path")
+        )
+
+        if not file_path:
+
+            raise RuntimeError(
+                "create_file step is missing file_path."
+            )
+
+        file_path = Path(
+            file_path
+        ).as_posix()
+
+        if not file_path.startswith(
+            root + "/"
+        ):
+
+            raise RuntimeError(
+                f"File '{file_path}' is outside "
+                f"the root folder '{root}'."
+            )
+
+    return root
+
+
+def _request_plan(
+    user_request: str,
+    tokens: int,
+):
+    """
+    Single planner model request.
+    """
+
+    prompt = planner_prompt(
+        user_request
+    )
+
+    result = generate(
+        prompt,
+        model=PLANNER_MODEL,
+        max_tokens=tokens,
+        reasoning_effort="low",
+        temperature=0,
+        return_meta=True,
+    )
+
+    text = _strip_json_fences(
+        result.get("content", "")
+    )
+
+    finish_reason = result.get(
+        "finish_reason"
+    )
+
+    print("\n===== RAW RESPONSE =====")
+    print(repr(text))
+
+    print(
+        f"finish_reason={finish_reason}, "
+        f"tokens_budget={tokens}"
+    )
+
+    print("========================")
+
+    return text, finish_reason
 
 
 def create_plan(
@@ -71,99 +289,116 @@ def create_plan(
     max_completion_retries: int = 2,
 ):
 
-    tokens = 3000
+    tokens = INITIAL_TOKENS
 
     text = ""
     finish_reason = None
 
-    for attempt in range(max_retries + 1):
+    # ---------------------------------------------------------
+    # Main Planning Loop
+    # ---------------------------------------------------------
 
-        prompt = planner_prompt(user_request)
+    for attempt in range(
+        max_retries + 1
+    ):
 
-        result = generate(
-            prompt,
-            model=PLANNER_MODEL,
-            max_tokens=tokens,
-            reasoning_effort="low",
-            return_meta=True,
-        )
+        try:
 
-        text = _strip_json_fences(result["content"])
-        finish_reason = result["finish_reason"]
+            text, finish_reason = _request_plan(
+                user_request,
+                tokens,
+            )
 
-        print("\n===== RAW RESPONSE =====")
-        print(repr(text))
-        print(
-            f"finish_reason={finish_reason}, "
-            f"tokens_budget={tokens}"
-        )
-        print("========================")
+        except Exception as e:
+
+            print(
+                "\n[planner] Model request failed:"
+                f" {type(e).__name__}: {e}"
+            )
+
+            if attempt >= max_retries:
+                raise
+
+            tokens = min(
+                int(tokens * 1.5),
+                MAX_TOKENS,
+            )
+
+            print(
+                f"[planner] Retrying with "
+                f"{tokens} tokens..."
+            )
+
+            continue
+
+        # -----------------------------------------------------
+        # Truncated response
+        # -----------------------------------------------------
 
         if finish_reason == "length":
 
             print(
-                f"[planner] Response truncated, retrying "
-                f"({attempt + 1}/{max_retries})..."
+                f"[planner] Response truncated "
+                f"(attempt {attempt + 1}/"
+                f"{max_retries + 1})."
             )
 
-            tokens = int(tokens * 1.75)
+            if attempt < max_retries:
 
-            continue
+                tokens = min(
+                    int(tokens * 1.5),
+                    MAX_TOKENS,
+                )
+
+                print(
+                    f"[planner] Retrying with "
+                    f"{tokens} tokens..."
+                )
+
+                continue
+
+            raise RuntimeError(
+                "Planner response still truncated "
+                "after "
+                f"{max_retries + 1} attempts."
+            )
+
+        # -----------------------------------------------------
+        # Successful completion
+        # -----------------------------------------------------
 
         break
 
-    else:
-
-        raise RuntimeError(
-            f"Planner failed after "
-            f"{max_retries + 1} attempts."
-        )
-
-    if finish_reason == "length":
-
-        raise RuntimeError(
-            "Planner response still truncated."
-        )
+    # ---------------------------------------------------------
+    # Parse JSON
+    # ---------------------------------------------------------
 
     try:
 
-        plan = json.loads(text)
+        plan = _parse_plan(text)
 
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
 
-        plan = [
-            json.loads(line)
-            for line in text.splitlines()
-            if line.strip()
-        ]
-
-    # ---------------------------------------------------------
-    # Validate root project folder
-    # ---------------------------------------------------------
-
-    from pathlib import Path
-
-    create_folder_steps = [
-        step for step in plan
-        if step["tool"] == "create_folder"
-    ]
-
-    if len(create_folder_steps) != 1:
-        raise RuntimeError(
-            "Planner must generate exactly one root project folder."
+        print(
+            "\n[planner] Invalid JSON response."
         )
 
-    root = create_folder_steps[0]["args"]["folder_name"]
-    for step in plan:
+        print(
+            f"[planner] Response length: "
+            f"{len(text)} characters"
+        )
 
-        if step["tool"] != "create_file":
-            continue
+        raise RuntimeError(
+            "Planner returned invalid JSON."
+        ) from e
 
-        file_path = Path(step["args"]["file_path"]).as_posix()
+    # ---------------------------------------------------------
+    # Validate plan
+    # ---------------------------------------------------------
 
-        if not file_path.startswith(root + "/"):
-            raise RuntimeError(
-                f"File '{file_path}' is outside the root folder '{root}'.")
+    root = _validate_plan_structure(
+        plan
+    )
 
     print("\n===== PLAN =====")
     print(type(plan))
@@ -173,47 +408,74 @@ def create_plan(
     # Programmatic completeness validation
     # ---------------------------------------------------------
 
-    for completion_attempt in range(max_completion_retries):
+    for completion_attempt in range(
+        max_completion_retries
+    ):
 
-        incomplete_folders = validate_plan_completeness(plan)
+        incomplete_folders = (
+            validate_plan_completeness(
+                plan
+            )
+        )
 
         if not incomplete_folders:
+
             break
 
         print(
-            "[planner] Missing implementation files in:\n"
-            f"{incomplete_folders}"
+            "\n[planner] Missing implementation "
+            "files in:"
         )
 
-        completion_prompt = planner_completion_prompt(
-            user_request,
-            plan,
-            incomplete_folders,
+        print(
+            incomplete_folders
+        )
+
+        completion_prompt = (
+            planner_completion_prompt(
+                user_request,
+                plan,
+                incomplete_folders,
+            )
         )
 
         result = generate(
             completion_prompt,
             model=PLANNER_MODEL,
-            max_tokens=1500,
+            max_tokens=COMPLETION_TOKENS,
             reasoning_effort="low",
+            temperature=0,
             return_meta=True,
         )
 
         addition_text = _strip_json_fences(
-            result["content"]
+            result.get("content", "")
         )
 
-        completion_finish_reason = result["finish_reason"]
+        completion_finish_reason = (
+            result.get("finish_reason")
+        )
 
-        print("\n===== PLAN COMPLETION =====")
-        print(repr(addition_text))
         print(
-            f"finish_reason={completion_finish_reason}"
+            "\n===== PLAN COMPLETION ====="
         )
-        print("===========================")
+
+        print(
+            repr(addition_text)
+        )
+
+        print(
+            f"finish_reason="
+            f"{completion_finish_reason}"
+        )
+
+        print(
+            "==========================="
+        )
 
         if (
-            completion_finish_reason == "length"
+            completion_finish_reason
+            == "length"
             or not addition_text
         ):
 
@@ -225,12 +487,15 @@ def create_plan(
 
         try:
 
-            additional_steps = json.loads(addition_text)
+            additional_steps = _parse_plan(
+                addition_text
+            )
 
         except json.JSONDecodeError:
 
             print(
-                "[planner] Invalid JSON returned."
+                "[planner] Invalid JSON returned "
+                "during plan completion."
             )
 
             break
@@ -239,40 +504,79 @@ def create_plan(
             _get_plan_file_paths(plan)
         )
 
-        new_steps = [
+        new_steps = []
 
-            step
+        for step in additional_steps:
 
-            for step in additional_steps
+            if step.get("tool") != "create_file":
+                continue
 
-            if (
-                step.get("tool") == "create_file"
-                and step.get("args", {}).get("file_path")
-                not in existing_paths
+            file_path = (
+                step
+                .get("args", {})
+                .get("file_path")
             )
 
-        ]
+            if not file_path:
+                continue
+
+            file_path = Path(
+                file_path
+            ).as_posix()
+
+            if file_path in existing_paths:
+                continue
+
+            if not file_path.startswith(
+                root + "/"
+            ):
+                continue
+
+            new_steps.append(
+                {
+                    "tool": "create_file",
+                    "args": {
+                        "file_path": file_path
+                    },
+                }
+            )
 
         if not new_steps:
 
             print(
-                "[planner] No additional files generated."
+                "[planner] No additional files "
+                "generated."
             )
 
             break
 
-        plan.extend(new_steps)
+        plan.extend(
+            new_steps
+        )
 
-        print("\n===== UPDATED PLAN =====")
+        print(
+            "\n===== UPDATED PLAN ====="
+        )
+
         print(plan)
 
-    remaining = validate_plan_completeness(plan)
+    # ---------------------------------------------------------
+    # Final completeness warning
+    # ---------------------------------------------------------
+
+    remaining = validate_plan_completeness(
+        plan
+    )
 
     if remaining:
 
         print(
-            "[planner] Warning: Some packages are "
-            f"still incomplete: {remaining}"
+            "[planner] Warning: Some packages "
+            "are still incomplete:"
+        )
+
+        print(
+            remaining
         )
 
     return plan
