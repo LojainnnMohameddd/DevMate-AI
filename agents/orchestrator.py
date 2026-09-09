@@ -18,7 +18,7 @@ MAX_FIX_ATTEMPTS = 3
 
 async def _write_files_via_mcp(plan, project):
     async with streamablehttp_client(
-        "http://mcp:8000/mcp"
+        "http://127.0.0.1:8000/mcp"
     ) as (read_stream, write_stream, _):
 
         async with ClientSession(read_stream, write_stream) as session:
@@ -81,7 +81,7 @@ def _merge_fixed_files(project, fixed_project):
 
 async def _apply_fixed_files(fixed_project):
     async with streamablehttp_client(
-        "http://mcp:8000/mcp"
+        "http://127.0.0.1:8000/mcp"
     ) as (read_stream, write_stream, _):
 
         async with ClientSession(
@@ -108,18 +108,36 @@ async def _apply_fixed_files(fixed_project):
                 print(result.content[0].text)
 
 
-async def execute_plan(user_request: str):
+def _report_progress(progress_callback, step, state, message=""):
+    """Report pipeline progress without affecting execution if the UI is disconnected."""
+    if progress_callback is None:
+        return
+
+    try:
+        progress_callback({
+            "step": step,
+            "state": state,
+            "message": message,
+        })
+    except Exception as e:
+        print(f"[orchestrator] Progress callback failed: {e}")
+
+
+async def execute_plan(user_request: str, progress_callback=None):
 
     # -----------------------------
     # Planning
     # -----------------------------
 
+    _report_progress(progress_callback, "planner", "running", "Creating the project plan...")
     print("1. Creating plan...")
 
     plan = create_plan(
         user_request
     )
 
+    _report_progress(progress_callback, "planner", "completed", "Project plan created.")
+    _report_progress(progress_callback, "coder", "running", "Generating the project structure and code...")
     print("Plan created!")
 
     # -----------------------------
@@ -133,6 +151,8 @@ async def execute_plan(user_request: str):
         plan
     )
 
+    _report_progress(progress_callback, "coder", "completed", "Project code generated.")
+    _report_progress(progress_callback, "validator", "running", "Checking project integrity...")
     print("Project generated!")
 
     # -----------------------------
@@ -148,6 +168,8 @@ async def execute_plan(user_request: str):
 
     print("Static validation completed!")
     print(validation)
+    _report_progress(progress_callback, "validator", "completed", "Static validation completed.")
+    _report_progress(progress_callback, "reviewer", "running", "Reviewing the generated project...")
 
     # -----------------------------
     # Reviewer
@@ -164,6 +186,7 @@ async def execute_plan(user_request: str):
 
     print("Review completed!")
     print(review)
+    _report_progress(progress_callback, "reviewer", "completed", "Project review completed.")
 
     # -----------------------------
     # Reviewer Auto-Fix Loop
@@ -179,6 +202,7 @@ async def execute_plan(user_request: str):
 
         review_fix_attempt += 1
 
+        _report_progress(progress_callback, "fixer", "running", "Fixing issues found during review...")
         print(
             f"\nReview flagged issues "
             f"(attempt {review_fix_attempt}/"
@@ -210,6 +234,7 @@ async def execute_plan(user_request: str):
 
         except Exception as e:
 
+            _report_progress(progress_callback, "fixer", "failed", "Fixer could not resolve the review issues.")
             print(
                 "\n[orchestrator] Fixer failed during "
                 f"review-fix attempt: {e}"
@@ -225,6 +250,8 @@ async def execute_plan(user_request: str):
             project,
             fixed_project
         )
+        _report_progress(progress_callback, "fixer", "completed", "Review fixes applied.")
+        _report_progress(progress_callback, "validator", "running", "Re-validating after fixes...")
 
         print(
             "\n5. Re-validating project after fix..."
@@ -236,6 +263,8 @@ async def execute_plan(user_request: str):
         )
 
         print(validation)
+        _report_progress(progress_callback, "validator", "completed", "Re-validation completed.")
+        _report_progress(progress_callback, "reviewer", "running", "Re-reviewing the updated project...")
 
         print(
             "6. Re-reviewing project..."
@@ -249,6 +278,7 @@ async def execute_plan(user_request: str):
         )
 
         print(review)
+        _report_progress(progress_callback, "reviewer", "completed", "Re-review completed.")
 
     if not review["request_satisfied"]:
 
@@ -265,6 +295,7 @@ async def execute_plan(user_request: str):
     # Write Initial Project via MCP
     # -----------------------------
 
+    _report_progress(progress_callback, "mcp", "running", "Writing project files through MCP...")
     print(
         "\n===== Writing Project via MCP ====="
     )
@@ -273,6 +304,7 @@ async def execute_plan(user_request: str):
         plan,
         project
     )
+    _report_progress(progress_callback, "mcp", "completed", "Project files written successfully.")
 
     print("\n===== PLAN =====")
     print(plan)
@@ -328,10 +360,18 @@ async def execute_plan(user_request: str):
     # Execution + Auto-Fix Loop
     # -----------------------------
 
+    execution = None
+
     for attempt in range(
         MAX_FIX_ATTEMPTS
     ):
 
+        _report_progress(
+            progress_callback,
+            "executor",
+            "running",
+            f"Running generated project (attempt {attempt + 1}/{MAX_FIX_ATTEMPTS})..."
+        )
         print(
             f"\n===== Execution Attempt "
             f"{attempt + 1}/"
@@ -350,6 +390,7 @@ async def execute_plan(user_request: str):
 
         if execution["passed"]:
 
+            _report_progress(progress_callback, "executor", "completed", "Project executed successfully.")
             print(
                 "\nProject executed successfully!"
             )
@@ -360,10 +401,12 @@ async def execute_plan(user_request: str):
         # Execution Failed
         # -------------------------
 
+        _report_progress(progress_callback, "executor", "failed", "Execution failed. Diagnosing the error...")
         print(
             "\nProject execution failed."
         )
 
+        _report_progress(progress_callback, "fixer", "running", "Diagnosing and fixing the execution error...")
         print(
             "\nSending execution error "
             "to Fix Agent..."
@@ -381,6 +424,7 @@ async def execute_plan(user_request: str):
 
         except Exception as e:
 
+            _report_progress(progress_callback, "fixer", "failed", "Fixer could not apply the required repair.")
             print(
                 "\n[orchestrator] Fixer failed "
                 f"during execution-fix attempt: {e}"
@@ -429,6 +473,7 @@ async def execute_plan(user_request: str):
 
             break
 
+        _report_progress(progress_callback, "fixer", "completed", "Execution fixes applied. Retrying...")
         print(
             "\nFixes applied successfully."
         )
@@ -443,6 +488,20 @@ async def execute_plan(user_request: str):
     print(
         "\n===== DevMate Finished ====="
     )
+
+    if execution and execution["passed"]:
+        _report_progress(progress_callback, "executor", "completed", "Execution completed successfully.")
+        _report_progress(progress_callback, "pipeline", "completed", "DevMate pipeline completed successfully.")
+    else:
+        _report_progress(progress_callback, "pipeline", "failed", "DevMate pipeline finished with an execution failure.")
+
+    return {
+        "success": bool(
+            execution and execution["passed"]
+        ),
+        "execution": execution,
+        "project_path": str(project_path),
+    }
 
 
 if __name__ == "__main__":

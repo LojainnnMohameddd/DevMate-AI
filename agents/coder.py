@@ -2,6 +2,7 @@ from prompts.coder_prompt import coder_file_prompt
 from utils.llm import generate
 from utils.repetition import find_repetition_loop
 
+
 CODER_MODEL = "openai/gpt-oss-120b"
 
 
@@ -21,11 +22,9 @@ def _strip_code_fences(text: str) -> str:
 
 
 def get_related_files(file_path: str, generated_files: list):
-
     related = []
 
     for file in generated_files:
-
         path = file["path"]
 
         # database -> config
@@ -40,7 +39,10 @@ def get_related_files(file_path: str, generated_files: list):
 
         # services -> models + schemas
         elif "/services/" in file_path.replace("\\", "/"):
-            if "/models/" in path.replace("\\", "/") or "/schemas/" in path.replace("\\", "/"):
+            if (
+                "/models/" in path.replace("\\", "/")
+                or "/schemas/" in path.replace("\\", "/")
+            ):
                 related.append(file)
 
         # routers -> services + schemas + database
@@ -70,7 +72,11 @@ def get_related_files(file_path: str, generated_files: list):
     return related
 
 
-def generate_project(user_request: str, plan: list, max_retries: int = 2) -> dict:
+def generate_project(
+    user_request: str,
+    plan: list,
+    max_retries: int = 2,
+) -> dict:
 
     all_files = [
         step["args"]["file_path"]
@@ -113,19 +119,26 @@ def generate_project(user_request: str, plan: list, max_retries: int = 2) -> dic
             content = _strip_code_fences(result["content"])
             finish_reason = result["finish_reason"]
 
-            print(f"\n===== FILE: {file_path} (attempt {attempt + 1}) =====")
+            print(
+                f"\n===== FILE: {file_path} "
+                f"(attempt {attempt + 1}) ====="
+            )
+
             print(
                 f"finish_reason={finish_reason}, "
                 f"tokens_budget={tokens}"
             )
+
             print("=" * 60)
 
+            # ---------------------------------------------------------
+            # Case 1: Model hit token limit
+            # ---------------------------------------------------------
             if finish_reason == "length":
 
                 loop_offset = find_repetition_loop(content)
 
                 if loop_offset is not None:
-
                     content = content[:loop_offset].rstrip()
 
                     print(
@@ -144,26 +157,44 @@ def generate_project(user_request: str, plan: list, max_retries: int = 2) -> dic
                 tokens = int(tokens * 1.75)
                 continue
 
-            if not content and not file_path.endswith("__init__.py"):
-
+            # ---------------------------------------------------------
+            # Case 2: Empty content
+            #
+            # requirements.txt is allowed to be empty because a project
+            # may use only Python standard-library modules.
+            # __init__.py is also allowed to be empty.
+            # ---------------------------------------------------------
+            if (
+                not content
+                and not file_path.endswith("__init__.py")
+                and not file_path.endswith("requirements.txt")
+            ):
                 print(
-                    f"[coder] '{file_path}' came back empty, retrying..."
+                    f"[coder] '{file_path}' came back empty, "
+                    f"retrying..."
                 )
-
                 continue
 
             break
 
         else:
-
             raise RuntimeError(
                 f"Coder failed to generate '{file_path}' "
                 f"after {max_retries + 1} attempts "
                 f"(last finish_reason={finish_reason})"
             )
 
-        if not content and not file_path.endswith("__init__.py"):
-
+        # -------------------------------------------------------------
+        # Empty-file validation
+        #
+        # requirements.txt and __init__.py are intentionally allowed
+        # to be empty.
+        # -------------------------------------------------------------
+        if (
+            not content
+            and not file_path.endswith("__init__.py")
+            and not file_path.endswith("requirements.txt")
+        ):
             raise RuntimeError(
                 f"Coder produced empty content for "
                 f"'{file_path}' after all retries."

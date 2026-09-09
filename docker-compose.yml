@@ -1,8 +1,11 @@
 services:
 
   mcp:
+
     build: .
+
     container_name: devmate-mcp
+
     working_dir: /app
 
     volumes:
@@ -16,23 +19,12 @@ services:
     ports:
       - "8000:8000"
 
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "python",
-          "-c",
-          "import socket; socket.create_connection(('127.0.0.1', 8000), 2)"
-        ]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 5s
 
+  backend:
 
-  orchestrator:
     build: .
-    container_name: devmate
+
+    container_name: devmate-backend
 
     working_dir: /app
 
@@ -42,11 +34,10 @@ services:
     env_file:
       - .env
 
-    stdin_open: true
-    tty: true
-
     depends_on:
-      mcp:
-        condition: service_healthy
+      - mcp
 
-    command: python main.py
+    command: python -m uvicorn api.main:app --host 0.0.0.0 --port 8080
+
+    ports:
+      - "8080:8080"

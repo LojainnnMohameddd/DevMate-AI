@@ -1,0 +1,25 @@
+/*
+  Global reset only. All theme tokens, typography, and component
+  styling for DevMate AI live in App.css — this file just makes sure
+  the page starts from a clean, unconstrained box so nothing here
+  fights the full-bleed layout (sticky navbar, ambient background,
+  etc.) that App.css builds on top of it.
+*/
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  min-height: 100vh;
+}
+
+#root {
+  min-height: 100vh;
+}
