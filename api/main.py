@@ -1,12 +1,18 @@
 import asyncio
+import base64
 import io
+import os
+import re
+import secrets
+import time
 import uuid
 import zipfile
 from pathlib import Path
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+import httpx
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi.responses import PlainTextResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 
 from agents.orchestrator import execute_plan
@@ -50,6 +56,7 @@ generation_jobs = {}
 
 def _update_generation(job_id, progress):
     job = generation_jobs.get(job_id)
+
     if not job:
         return
 
@@ -58,6 +65,7 @@ def _update_generation(job_id, progress):
     job["message"] = progress.get("message", "")
 
     history = job.setdefault("history", [])
+
     history.append(
         {
             "step": progress.get("step"),
@@ -76,7 +84,8 @@ def _run_generation(job_id: str, user_request: str):
             execute_plan(
                 user_request,
                 progress_callback=lambda progress: _update_generation(
-                    job_id, progress
+                    job_id,
+                    progress,
                 ),
             )
         )
@@ -111,12 +120,115 @@ def _run_generation(job_id: str, user_request: str):
 
 
 # =========================
+# GITHUB CONFIGURATION
+# =========================
+
+GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID")
+GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET")
+
+GITHUB_CALLBACK_URL = os.getenv(
+    "GITHUB_CALLBACK_URL",
+    "http://127.0.0.1:8080/github/callback",
+)
+
+FRONTEND_URL = os.getenv(
+    "FRONTEND_URL",
+    "http://localhost:5173",
+)
+
+GITHUB_AUTHORIZE_URL = "https://github.com/login/oauth/authorize"
+GITHUB_ACCESS_TOKEN_URL = "https://github.com/login/oauth/access_token"
+GITHUB_API_URL = "https://api.github.com"
+
+
+# =========================
+# GITHUB OAUTH STATE
+# =========================
+
+github_oauth_states = {}
+
+GITHUB_STATE_EXPIRY_SECONDS = 10 * 60
+
+
+# =========================
+# GITHUB CONNECTION
+# =========================
+
+github_connection = {
+    "connected": False,
+    "login": None,
+    "name": None,
+    "avatar_url": None,
+    "scopes": [],
+    "access_token": None,
+}
+
+
+def _cleanup_github_oauth_states():
+    now = time.time()
+
+    expired_states = [
+        state
+        for state, data in github_oauth_states.items()
+        if now - data["created_at"] > GITHUB_STATE_EXPIRY_SECONDS
+    ]
+
+    for state in expired_states:
+        github_oauth_states.pop(state, None)
+
+
+def _require_github_config():
+    if not GITHUB_CLIENT_ID:
+        raise HTTPException(
+            status_code=500,
+            detail="GITHUB_CLIENT_ID is not configured.",
+        )
+
+    if not GITHUB_CLIENT_SECRET:
+        raise HTTPException(
+            status_code=500,
+            detail="GITHUB_CLIENT_SECRET is not configured.",
+        )
+
+
+def _require_github_connection():
+    if not github_connection["connected"]:
+        raise HTTPException(
+            status_code=401,
+            detail="GitHub is not connected.",
+        )
+
+    access_token = github_connection.get("access_token")
+
+    if not access_token:
+        raise HTTPException(
+            status_code=401,
+            detail="GitHub access token is missing.",
+        )
+
+    return access_token
+
+
+def _github_headers(access_token: str):
+    return {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {access_token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+# =========================
 # REQUEST MODELS
 # =========================
 
 
 class GenerateRequest(BaseModel):
     request: str
+
+
+class GitHubPushRequest(BaseModel):
+    repository: str
+    project_path: str
 
 
 # =========================
@@ -129,6 +241,729 @@ async def health():
     return {
         "status": "ok",
         "service": "DevMate API",
+    }
+
+
+# =========================
+# GITHUB CONNECT
+# =========================
+
+
+@app.get("/github/connect")
+async def github_connect():
+    """
+    Start GitHub OAuth authorization.
+    """
+
+    _require_github_config()
+    _cleanup_github_oauth_states()
+
+    state = secrets.token_urlsafe(32)
+
+    github_oauth_states[state] = {
+        "created_at": time.time(),
+    }
+
+    authorization_url = (
+        f"{GITHUB_AUTHORIZE_URL}"
+        f"?client_id={GITHUB_CLIENT_ID}"
+        f"&redirect_uri={GITHUB_CALLBACK_URL}"
+        f"&state={state}"
+    )
+
+    return RedirectResponse(
+        url=authorization_url,
+        status_code=302,
+    )
+
+
+# =========================
+# GITHUB CALLBACK
+# =========================
+
+
+@app.get("/github/callback")
+async def github_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    error_description: str | None = None,
+):
+    """
+    GitHub redirects here after authorization.
+    """
+
+    if error:
+        error_message = error_description or error
+
+        return RedirectResponse(
+            url=(
+                f"{FRONTEND_URL}"
+                f"?github=error"
+                f"&message={error_message}"
+            ),
+            status_code=302,
+        )
+
+    if not code:
+        return RedirectResponse(
+            url=(
+                f"{FRONTEND_URL}"
+                "?github=error"
+                "&message=Missing authorization code"
+            ),
+            status_code=302,
+        )
+
+    if not state:
+        return RedirectResponse(
+            url=(
+                f"{FRONTEND_URL}"
+                "?github=error"
+                "&message=Missing OAuth state"
+            ),
+            status_code=302,
+        )
+
+    state_data = github_oauth_states.pop(state, None)
+
+    if not state_data:
+        return RedirectResponse(
+            url=(
+                f"{FRONTEND_URL}"
+                "?github=error"
+                "&message=Invalid or expired OAuth state"
+            ),
+            status_code=302,
+        )
+
+    if time.time() - state_data["created_at"] > GITHUB_STATE_EXPIRY_SECONDS:
+        return RedirectResponse(
+            url=(
+                f"{FRONTEND_URL}"
+                "?github=error"
+                "&message=OAuth state expired"
+            ),
+            status_code=302,
+        )
+
+    _require_github_config()
+
+    # Exchange authorization code for access token.
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            token_response = await client.post(
+                GITHUB_ACCESS_TOKEN_URL,
+                data={
+                    "client_id": GITHUB_CLIENT_ID,
+                    "client_secret": GITHUB_CLIENT_SECRET,
+                    "code": code,
+                    "redirect_uri": GITHUB_CALLBACK_URL,
+                },
+                headers={
+                    "Accept": "application/json",
+                },
+            )
+
+        if token_response.status_code != 200:
+            return RedirectResponse(
+                url=(
+                    f"{FRONTEND_URL}"
+                    "?github=error"
+                    "&message=GitHub token exchange failed"
+                ),
+                status_code=302,
+            )
+
+        token_data = token_response.json()
+
+    except httpx.HTTPError:
+        return RedirectResponse(
+            url=(
+                f"{FRONTEND_URL}"
+                "?github=error"
+                "&message=Could not connect to GitHub"
+            ),
+            status_code=302,
+        )
+
+    access_token = token_data.get("access_token")
+
+    if not access_token:
+        return RedirectResponse(
+            url=(
+                f"{FRONTEND_URL}"
+                "?github=error"
+                "&message=GitHub did not return an access token"
+            ),
+            status_code=302,
+        )
+
+    scope_value = token_data.get("scope", "")
+
+    if isinstance(scope_value, str):
+        scopes = [
+            scope.strip()
+            for scope in scope_value.split(",")
+            if scope.strip()
+        ]
+    else:
+        scopes = []
+
+    # Fetch authenticated GitHub user.
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            user_response = await client.get(
+                f"{GITHUB_API_URL}/user",
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "Authorization": f"Bearer {access_token}",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+            )
+
+        if user_response.status_code != 200:
+            return RedirectResponse(
+                url=(
+                    f"{FRONTEND_URL}"
+                    "?github=error"
+                    "&message=Could not retrieve GitHub user"
+                ),
+                status_code=302,
+            )
+
+        user_data = user_response.json()
+
+    except httpx.HTTPError:
+        return RedirectResponse(
+            url=(
+                f"{FRONTEND_URL}"
+                "?github=error"
+                "&message=Could not retrieve GitHub account"
+            ),
+            status_code=302,
+        )
+
+    # Store connection on backend only.
+    github_connection.update(
+        {
+            "connected": True,
+            "login": user_data.get("login"),
+            "name": user_data.get("name"),
+            "avatar_url": user_data.get("avatar_url"),
+            "scopes": scopes,
+            "access_token": access_token,
+        }
+    )
+
+    return RedirectResponse(
+        url=f"{FRONTEND_URL}?github=connected",
+        status_code=302,
+    )
+
+
+# =========================
+# GITHUB STATUS
+# =========================
+
+
+@app.get("/github/status")
+async def github_status():
+    """
+    Return current GitHub connection status.
+
+    The access token is intentionally excluded.
+    """
+
+    return {
+        "connected": github_connection["connected"],
+        "user": {
+            "login": github_connection["login"],
+            "name": github_connection["name"],
+            "avatar_url": github_connection["avatar_url"],
+        }
+        if github_connection["connected"]
+        else None,
+        "scopes": github_connection["scopes"],
+    }
+
+
+# =========================
+# GITHUB REPOSITORIES
+# =========================
+
+
+@app.get("/github/repos")
+async def github_repositories(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(100, ge=1, le=100),
+):
+    """
+    Return repositories accessible to the connected GitHub user.
+
+    The GitHub access token remains on the backend.
+    """
+
+    access_token = _require_github_connection()
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.get(
+                f"{GITHUB_API_URL}/user/repos",
+                params={
+                    "page": page,
+                    "per_page": per_page,
+                },
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "Authorization": f"Bearer {access_token}",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+            )
+
+    except httpx.HTTPError:
+        raise HTTPException(
+            status_code=502,
+            detail="Could not connect to GitHub.",
+        )
+
+    if response.status_code == 401:
+        github_connection.update(
+            {
+                "connected": False,
+                "login": None,
+                "name": None,
+                "avatar_url": None,
+                "scopes": [],
+                "access_token": None,
+            }
+        )
+
+        raise HTTPException(
+            status_code=401,
+            detail="GitHub authorization is no longer valid. Please reconnect.",
+        )
+
+    if response.status_code == 403:
+        raise HTTPException(
+            status_code=403,
+            detail="GitHub denied repository access for this application.",
+        )
+
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail="GitHub failed to return repositories.",
+        )
+
+    repositories = response.json()
+
+    result = []
+
+    for repository in repositories:
+        permissions = repository.get("permissions") or {}
+
+        result.append(
+            {
+                "id": repository.get("id"),
+                "name": repository.get("name"),
+                "full_name": repository.get("full_name"),
+                "private": repository.get("private", False),
+                "owner": {
+                    "login": (repository.get("owner") or {}).get("login"),
+                },
+                "default_branch": repository.get("default_branch"),
+                "html_url": repository.get("html_url"),
+                "archived": repository.get("archived", False),
+                "can_push": bool(permissions.get("push", False)),
+                "can_admin": bool(permissions.get("admin", False)),
+            }
+        )
+
+    return {
+        "repositories": result,
+        "page": page,
+        "per_page": per_page,
+        "count": len(result),
+    }
+
+
+# =========================
+# GITHUB PUSH
+# =========================
+
+
+@app.post("/github/push")
+async def github_push(request: GitHubPushRequest):
+    """Push a generated project to a new GitHub branch."""
+    access_token = _require_github_connection()
+    repository = request.repository.strip()
+    project_path_value = request.project_path.strip()
+
+    if not repository or "/" not in repository:
+        raise HTTPException(status_code=400, detail="A valid GitHub repository is required.")
+    if not project_path_value:
+        raise HTTPException(status_code=400, detail="Project path is required.")
+
+    owner, repo_name = repository.split("/", 1)
+    owner, repo_name = owner.strip(), repo_name.strip()
+    if not owner or not repo_name or "/" in owner:
+        raise HTTPException(status_code=400, detail="Invalid GitHub repository.")
+
+    project_path = Path(project_path_value).resolve()
+    generated_base = GENERATED_PROJECTS_DIR.resolve()
+    try:
+        project_path.relative_to(generated_base)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Project path must be inside generated_projects.")
+
+    if not project_path.exists() or not project_path.is_dir():
+        raise HTTPException(status_code=404, detail="Generated project was not found.")
+
+    project_files = []
+    for file_path in sorted(project_path.rglob("*")):
+        if not file_path.is_file():
+            continue
+        relative_path = file_path.relative_to(project_path)
+        if "__pycache__" in relative_path.parts or file_path.suffix == ".pyc":
+            continue
+        try:
+            content = file_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            raise HTTPException(status_code=415, detail=f"GitHub push only supports UTF-8 text files: {relative_path.as_posix()}")
+        project_files.append({"path": relative_path.as_posix(), "content": content})
+
+    if not project_files:
+        raise HTTPException(status_code=400, detail="The generated project contains no files to push.")
+
+    api_repository = f"{GITHUB_API_URL}/repos/{owner}/{repo_name}"
+    headers = _github_headers(access_token)
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            repo_response = await client.get(api_repository, headers=headers)
+            if repo_response.status_code == 401:
+                raise HTTPException(status_code=401, detail="GitHub authorization is no longer valid. Please reconnect.")
+            if repo_response.status_code == 404:
+                raise HTTPException(status_code=404, detail="GitHub repository was not found or is not accessible.")
+            if repo_response.status_code != 200:
+                raise HTTPException(status_code=502, detail="Could not read the GitHub repository.")
+
+            default_branch = repo_response.json().get("default_branch")
+            if not default_branch:
+                raise HTTPException(status_code=502, detail="GitHub repository does not have a default branch.")
+
+            # A newly-created GitHub repository can be completely empty.
+            # In that case GitHub may expose a default_branch name in the
+            # repository metadata, but the branch ref does not exist yet.
+            # We support both normal repositories and empty repositories.
+            ref_response = await client.get(
+                f"{api_repository}/git/ref/heads/{default_branch}",
+                headers=headers,
+            )
+
+            base_commit_sha = None
+            base_tree_sha = None
+
+            if ref_response.status_code == 200:
+                base_commit_sha = (
+                    (ref_response.json().get("object") or {}).get("sha")
+                )
+                if not base_commit_sha:
+                    raise HTTPException(status_code=502, detail="GitHub did not return the default branch commit.")
+
+                commit_response = await client.get(
+                    f"{api_repository}/git/commits/{base_commit_sha}",
+                    headers=headers,
+                )
+                if commit_response.status_code != 200:
+                    raise HTTPException(status_code=502, detail="Could not read the base Git commit.")
+
+                base_tree_sha = ((commit_response.json().get("tree") or {}).get("sha"))
+                if not base_tree_sha:
+                    raise HTTPException(status_code=502, detail="GitHub did not return the base tree.")
+
+            elif ref_response.status_code not in (404, 409):
+                github_message = "Unknown GitHub error"
+                try:
+                    github_message = ref_response.json().get("message") or github_message
+                except Exception:
+                    pass
+
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        f"GitHub branch lookup failed "
+                        f"(HTTP {ref_response.status_code}): {github_message}"
+                    ),
+                )
+
+            # GitHub cannot create a new ref in a completely empty
+            # repository. Bootstrap the default branch with the first generated
+            # file, then create the DevMate branch from that commit. After the
+            # branch is created, remove the bootstrap file from the default
+            # branch so the generated project lives on the DevMate branch only.
+            bootstrap_file_path = None
+            bootstrap_file_sha = None
+
+            if base_commit_sha is None:
+                bootstrap_file = project_files[0]
+                bootstrap_file_path = bootstrap_file["path"]
+
+                bootstrap_response = await client.put(
+                    f"{api_repository}/contents/{bootstrap_file_path}",
+                    headers=headers,
+                    json={
+                        "message": f"chore: initialize repository for DevMate project {project_path.name}",
+                        "content": base64.b64encode(
+                            bootstrap_file["content"].encode("utf-8")
+                        ).decode("ascii"),
+                        "branch": default_branch,
+                    },
+                )
+
+                if bootstrap_response.status_code not in (200, 201):
+                    detail = "GitHub could not initialize the empty repository."
+                    try:
+                        detail = bootstrap_response.json().get("message") or detail
+                    except Exception:
+                        pass
+                    raise HTTPException(status_code=502, detail=detail)
+
+                bootstrap_data = bootstrap_response.json()
+                bootstrap_file_sha = (
+                    (bootstrap_data.get("content") or {}).get("sha")
+                )
+                if not bootstrap_file_sha:
+                    raise HTTPException(
+                        status_code=502,
+                        detail="GitHub did not return the bootstrap file SHA.",
+                    )
+
+                ref_response = await client.get(
+                    f"{api_repository}/git/ref/heads/{default_branch}",
+                    headers=headers,
+                )
+                if ref_response.status_code != 200:
+                    raise HTTPException(
+                        status_code=502,
+                        detail="GitHub could not read the initialized default branch.",
+                    )
+
+                base_commit_sha = (
+                    (ref_response.json().get("object") or {}).get("sha")
+                )
+                if not base_commit_sha:
+                    raise HTTPException(
+                        status_code=502,
+                        detail="GitHub did not return the initialized branch commit.",
+                    )
+
+                commit_response = await client.get(
+                    f"{api_repository}/git/commits/{base_commit_sha}",
+                    headers=headers,
+                )
+                if commit_response.status_code != 200:
+                    raise HTTPException(
+                        status_code=502,
+                        detail="Could not read the initialized base Git commit.",
+                    )
+
+                base_tree_sha = (
+                    (commit_response.json().get("tree") or {}).get("sha")
+                )
+                if not base_tree_sha:
+                    raise HTTPException(
+                        status_code=502,
+                        detail="GitHub did not return the initialized base tree.",
+                    )
+
+            tree_entries = []
+            for project_file in project_files:
+                blob_response = await client.post(
+                    f"{api_repository}/git/blobs",
+                    headers=headers,
+                    json={
+                        "content": project_file["content"],
+                        "encoding": "utf-8",
+                    },
+                )
+                if blob_response.status_code not in (200, 201):
+                    detail = "GitHub could not create a file blob."
+                    try:
+                        detail = blob_response.json().get("message") or detail
+                    except Exception:
+                        pass
+                    raise HTTPException(status_code=502, detail=detail)
+
+                blob_sha = blob_response.json().get("sha")
+                if not blob_sha:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=(
+                            "GitHub did not return a blob SHA for "
+                            f"{project_file['path']}."
+                        ),
+                    )
+
+                tree_entries.append(
+                    {
+                        "path": project_file["path"],
+                        "mode": "100644",
+                        "type": "blob",
+                        "sha": blob_sha,
+                    }
+                )
+
+            tree_response = await client.post(
+                f"{api_repository}/git/trees",
+                headers=headers,
+                json=(
+                    {"base_tree": base_tree_sha, "tree": tree_entries}
+                    if base_tree_sha
+                    else {"tree": tree_entries}
+                ),
+            )
+            if tree_response.status_code not in (200, 201):
+                detail = "GitHub could not create the project tree."
+                try:
+                    detail = tree_response.json().get("message") or detail
+                except Exception:
+                    pass
+                raise HTTPException(status_code=502, detail=detail)
+
+            tree_sha = tree_response.json().get("sha")
+            if not tree_sha:
+                raise HTTPException(
+                    status_code=502,
+                    detail="GitHub did not return the project tree SHA.",
+                )
+
+            project_name = project_path.name or "project"
+            safe_project_name = re.sub(
+                r"[^a-zA-Z0-9._-]+",
+                "-",
+                project_name.lower(),
+            ).strip("-") or "project"
+            branch_name = (
+                f"devmate/{safe_project_name}-{uuid.uuid4().hex[:8]}"
+            )
+
+            new_commit_response = await client.post(
+                f"{api_repository}/git/commits",
+                headers=headers,
+                json={
+                    "message": f"feat: add generated project {project_name}",
+                    "tree": tree_sha,
+                    **(
+                        {"parents": [base_commit_sha]}
+                        if base_commit_sha
+                        else {}
+                    ),
+                },
+            )
+            if new_commit_response.status_code not in (200, 201):
+                detail = "GitHub could not create the project commit."
+                try:
+                    detail = new_commit_response.json().get("message") or detail
+                except Exception:
+                    pass
+                raise HTTPException(status_code=502, detail=detail)
+
+            commit_sha = new_commit_response.json().get("sha")
+            if not commit_sha:
+                raise HTTPException(
+                    status_code=502,
+                    detail="GitHub did not return the commit SHA.",
+                )
+
+            branch_response = await client.post(
+                f"{api_repository}/git/refs",
+                headers=headers,
+                json={
+                    "ref": f"refs/heads/{branch_name}",
+                    "sha": commit_sha,
+                },
+            )
+            if branch_response.status_code not in (200, 201):
+                detail = "GitHub could not create the project branch."
+                try:
+                    detail = branch_response.json().get("message") or detail
+                except Exception:
+                    pass
+                raise HTTPException(status_code=502, detail=detail)
+
+            # The DevMate branch now contains the complete generated project.
+            # Remove only the temporary bootstrap file from the default branch.
+            if bootstrap_file_path and bootstrap_file_sha:
+                delete_response = await client.request(
+                    "DELETE",
+                    f"{api_repository}/contents/{bootstrap_file_path}",
+                    headers=headers,
+                    json={
+                        "message": (
+                            f"chore: remove DevMate bootstrap file "
+                            f"from {default_branch}"
+                        ),
+                        "sha": bootstrap_file_sha,
+                        "branch": default_branch,
+                    },
+                )
+
+                if delete_response.status_code not in (200, 201):
+                    detail = (
+                        "Project branch was created, but GitHub could not "
+                        "clean the default branch."
+                    )
+                    try:
+                        detail = (
+                            delete_response.json().get("message") or detail
+                        )
+                    except Exception:
+                        pass
+                    raise HTTPException(status_code=502, detail=detail)
+
+    except httpx.HTTPError:
+        raise HTTPException(status_code=502, detail="Could not connect to GitHub.")
+
+    return {
+        "status": "success",
+        "repository": repository,
+        "branch": branch_name,
+        "commit_sha": commit_sha,
+        "commit_url": f"https://github.com/{owner}/{repo_name}/commit/{commit_sha}",
+        "branch_url": f"https://github.com/{owner}/{repo_name}/tree/{branch_name}",
+        "file_count": len(project_files),
+        "message": f"Project pushed successfully to {repository} on branch {branch_name}.",
+    }
+
+
+# =========================
+# GITHUB DISCONNECT
+# =========================
+
+
+@app.post("/github/disconnect")
+async def github_disconnect():
+    """
+    Disconnect the current local GitHub session.
+    """
+
+    github_connection.update(
+        {
+            "connected": False,
+            "login": None,
+            "name": None,
+            "avatar_url": None,
+            "scopes": [],
+            "access_token": None,
+        }
+    )
+
+    return {
+        "status": "ok",
+        "connected": False,
+        "message": "GitHub disconnected.",
     }
 
 
@@ -319,6 +1154,7 @@ async def read_project_file(
         return target_file.read_text(
             encoding="utf-8"
         )
+
     except UnicodeDecodeError:
         raise HTTPException(
             status_code=415,
@@ -364,6 +1200,7 @@ async def download_project(project_name: str):
         mode="w",
         compression=zipfile.ZIP_DEFLATED,
     ) as zip_file:
+
         for file_path in project_path.rglob("*"):
             if not file_path.is_file():
                 continue

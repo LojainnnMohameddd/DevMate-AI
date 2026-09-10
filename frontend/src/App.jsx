@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import "./App.css";
 
 const API_BASE_URL = "http://127.0.0.1:8080";
@@ -19,6 +19,7 @@ const iconPaths = {
   folder: "M3.5 6.5h5l1.7 2h10.3v9.8a1.7 1.7 0 0 1-1.7 1.7H5.2a1.7 1.7 0 0 1-1.7-1.7V6.5Z",
   file: "M6 3.5h7l5 5v12H6a2 2 0 0 1-2-2v-13a2 2 0 0 1 2-2Z M13 3.5v5h5",
   spinner: "M12 3a9 9 0 1 0 9 9",
+  github: "M15 22v-4.2c0-1.2-.4-2.1-1.1-2.7 3.6-.4 7.4-1.8 7.4-8a6.2 6.2 0 0 0-1.7-4.3c.2-.5.7-2.1-.2-4.2 0 0-1.4-.4-4.4 1.7a15.2 15.2 0 0 0-8 0C4 2.2 2.6 2.6 2.6 2.6c-.9 2.1-.4 3.7-.2 4.2A6.2 6.2 0 0 0 .7 7.1c0 6.2 3.8 7.6 7.4 8-.7.6-1.1 1.5-1.1 2.7V22 M7 18c-3.3 1.5-3.3-1.5-4.7-1.7",
 };
 
 function Icon({ name, size = 18, strokeWidth = 1.8, className = "" }) {
@@ -62,6 +63,117 @@ function App() {
   const [fileContent, setFileContent] = useState("");
   const [fileLoading, setFileLoading] = useState(false);
 
+  const [githubConnected, setGithubConnected] = useState(false);
+  const [githubUser, setGithubUser] = useState(null);
+  const [githubRepos, setGithubRepos] = useState([]);
+  const [selectedRepo, setSelectedRepo] = useState("");
+  const [githubLoading, setGithubLoading] = useState(true);
+  const [githubError, setGithubError] = useState("");
+  const [githubPushing, setGithubPushing] = useState(false);
+  const [githubPushResult, setGithubPushResult] = useState(null);
+
+  const loadGithub = async () => {
+    setGithubLoading(true);
+    setGithubError("");
+
+    try {
+      const statusResponse = await fetch(`${API_BASE_URL}/github/status`);
+      const statusData = await statusResponse.json();
+
+      if (!statusResponse.ok) {
+        throw new Error(
+          statusData.detail || "Failed to check GitHub connection."
+        );
+      }
+
+      const connected = Boolean(statusData.connected);
+      setGithubConnected(connected);
+      setGithubUser(statusData.user || null);
+
+      if (!connected) {
+        setGithubRepos([]);
+        setSelectedRepo("");
+        return;
+      }
+
+      const reposResponse = await fetch(`${API_BASE_URL}/github/repos`);
+      const reposData = await reposResponse.json();
+
+      if (!reposResponse.ok) {
+        throw new Error(
+          reposData.detail || "Failed to load GitHub repositories."
+        );
+      }
+
+      const writableRepos = (reposData.repositories || []).filter(
+        (repo) => repo.can_push
+      );
+
+      setGithubRepos(writableRepos);
+
+      if (
+        selectedRepo &&
+        !writableRepos.some((repo) => repo.full_name === selectedRepo)
+      ) {
+        setSelectedRepo("");
+      }
+    } catch (error) {
+      console.error("GitHub loading error:", error);
+      setGithubError(
+        error.message || "Unable to connect to the GitHub backend."
+      );
+      setGithubConnected(false);
+      setGithubUser(null);
+      setGithubRepos([]);
+      setSelectedRepo("");
+    } finally {
+      setGithubLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+
+    if (params.get("github") === "connected") {
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
+
+    loadGithub();
+  }, []);
+
+  const handleGithubConnect = () => {
+    window.location.href = `${API_BASE_URL}/github/connect`;
+  };
+
+  const handleGithubPush = async () => {
+    if (!githubConnected || !selectedRepo || !result?.project_path || githubPushing) {
+      return;
+    }
+
+    setGithubPushing(true);
+    setGithubError("");
+    setGithubPushResult(null);
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/github/push`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repository: selectedRepo, project_path: result.project_path }),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.detail || data.message || "GitHub push failed.");
+      }
+      setGithubPushResult(data);
+    } catch (error) {
+      console.error("GitHub push error:", error);
+      setGithubError(error.message || "Unable to push the project to GitHub.");
+    } finally {
+      setGithubPushing(false);
+    }
+  };
+
+
   const handleGenerate = async () => {
     if (!request.trim() || status === "generating") {
       return;
@@ -72,6 +184,7 @@ function App() {
     setProjectFiles([]);
     setSelectedFile(null);
     setFileContent("");
+    setGithubPushResult(null);
     setCurrentStep("planner");
     setPipelineState({
       planner: "running",
@@ -541,6 +654,162 @@ function App() {
               </span>
             </button>
           </div>
+        </section>
+
+        {/* =========================
+            GITHUB INTEGRATION
+           ========================= */}
+
+        <section className="github-card" aria-label="GitHub integration">
+          <div className="github-card-header">
+            <div className="github-heading">
+              <div className="github-icon">
+                <Icon name="github" size={19} />
+              </div>
+
+              <div>
+                <span className="section-kicker">SHIP TO GITHUB</span>
+                <h2>GitHub integration</h2>
+                <p>
+                  Connect your account and choose where generated projects
+                  will be shipped.
+                </p>
+              </div>
+            </div>
+
+            <div
+              className={`github-connection-state ${githubConnected ? "connected" : ""
+                }`}
+            >
+              <span />
+              {githubLoading
+                ? "Checking..."
+                : githubConnected
+                  ? "Connected"
+                  : "Not connected"}
+            </div>
+          </div>
+
+          {githubLoading ? (
+            <div className="github-loading">
+              <Icon name="spinner" size={17} className="spin" />
+              <span>Checking GitHub connection...</span>
+            </div>
+          ) : !githubConnected ? (
+            <div className="github-connect-row">
+              <div>
+                <strong>Connect your GitHub account</strong>
+                <p>
+                  DevMate will ask GitHub for permission to access your
+                  repositories.
+                </p>
+              </div>
+
+              <button
+                className="github-button github-button-primary"
+                type="button"
+                onClick={handleGithubConnect}
+              >
+                <Icon name="github" size={16} />
+                Connect GitHub
+              </button>
+            </div>
+          ) : (
+            <div className="github-connected-content">
+              <div className="github-user">
+                {githubUser?.avatar_url ? (
+                  <img
+                    src={githubUser.avatar_url}
+                    alt=""
+                    className="github-avatar"
+                  />
+                ) : (
+                  <div className="github-avatar github-avatar-fallback">
+                    <Icon name="github" size={16} />
+                  </div>
+                )}
+
+                <div>
+                  <span className="metric-label">GITHUB ACCOUNT</span>
+                  <strong>
+                    {githubUser?.login || "Connected account"}
+                  </strong>
+                  {githubUser?.name && (
+                    <span>{githubUser.name}</span>
+                  )}
+                </div>
+              </div>
+
+              <div className="github-repository-field">
+                <label htmlFor="github-repository">
+                  Repository target
+                </label>
+
+                <select
+                  id="github-repository"
+                  value={selectedRepo}
+                  onChange={(event) => setSelectedRepo(event.target.value)}
+                  disabled={githubRepos.length === 0}
+                >
+                  <option value="">
+                    {githubRepos.length
+                      ? "Select a repository"
+                      : "No writable repositories found"}
+                  </option>
+
+                  {githubRepos.map((repo) => (
+                    <option key={repo.id} value={repo.full_name}>
+                      {repo.full_name}
+                    </option>
+                  ))}
+                </select>
+
+                <span>
+                  {githubRepos.length} writable{" "}
+                  {githubRepos.length === 1 ? "repository" : "repositories"}{" "}
+                  available
+                </span>
+              </div>
+
+              <button
+                className={`github-button ${githubPushing ? "github-button-disabled" : "github-button-primary"}`}
+                type="button"
+                onClick={handleGithubPush}
+                disabled={githubPushing || !selectedRepo || status !== "completed" || !result?.project_path}
+                title={!result?.project_path ? "Generate a project first" : !selectedRepo ? "Select a repository first" : "Push the generated project to GitHub"}
+              >
+                <Icon name={githubPushing ? "spinner" : "arrow"} size={15} className={githubPushing ? "spin" : ""} />
+                {githubPushing ? "Pushing..." : "Push to GitHub"}
+              </button>
+            </div>
+          )}
+
+          {githubError && (
+            <div className="github-error">
+              <Icon name="alert" size={15} />
+              <span>{githubError}</span>
+              <button type="button" onClick={loadGithub}>
+                Retry
+              </button>
+            </div>
+          )}
+
+          {githubPushResult && (
+            <div className="github-push-success">
+              <div className="github-push-success-copy">
+                <span className="github-push-success-dot" />
+                <div>
+                  <strong>Project pushed successfully</strong>
+                  <span>{githubPushResult.file_count} files committed to {githubPushResult.repository}</span>
+                </div>
+              </div>
+
+              <a className="github-push-link" href={githubPushResult.branch_url} target="_blank" rel="noreferrer">
+                View branch
+                <Icon name="arrow" size={14} />
+              </a>
+            </div>
+          )}
         </section>
 
         {/* =========================
