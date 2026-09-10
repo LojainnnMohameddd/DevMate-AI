@@ -18,7 +18,7 @@ MAX_FIX_ATTEMPTS = 3
 
 async def _write_files_via_mcp(plan, project):
     async with streamablehttp_client(
-        "http://127.0.0.1:8000/mcp"
+        "http://mcp:8000/mcp"
     ) as (read_stream, write_stream, _):
 
         async with ClientSession(read_stream, write_stream) as session:
@@ -81,7 +81,7 @@ def _merge_fixed_files(project, fixed_project):
 
 async def _apply_fixed_files(fixed_project):
     async with streamablehttp_client(
-        "http://127.0.0.1:8000/mcp"
+        "http://mcp:8000/mcp"
     ) as (read_stream, write_stream, _):
 
         async with ClientSession(
